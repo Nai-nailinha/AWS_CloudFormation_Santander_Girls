@@ -1,0 +1,213 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Lab CloudFormation: VPC (2 subnets públicas) + EC2 (Amazon Linux 2023)
+  com NGINX, S3 com SSE-KMS (AWS managed), Security Group e SSM habilitado.
+
+Parameters:
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+    Description: CIDR da VPC
+  PublicSubnet1Cidr:
+    Type: String
+    Default: 10.0.1.0/24
+    Description: CIDR da Subnet pública 1
+  PublicSubnet2Cidr:
+    Type: String
+    Default: 10.0.2.0/24
+    Description: CIDR da Subnet pública 2
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues: [t2.micro, t3.micro, t3.small, t3a.micro]
+    Description: Tipo da instância EC2
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Default: ""
+    Description: (Opcional) Nome do KeyPair para SSH. Deixe vazio se usar só SSM.
+  AllowedSSHLocation:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: CIDR permitido para SSH (ex.: 203.0.113.4/32). Use SSM se possível.
+
+Mappings:
+  RegionMap:
+    # Map de AZs padrão (apenas rótulo) — não fixa a AZ, só ilustra.
+    # Se quiser escolher AZs específicas, substitua por Fn::GetAZs/Select no Subnet.
+    dummy:
+      a: a
+      b: b
+
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-vpc"
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-igw" }]
+
+  AttachIgw:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-public-rt" }]
+
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachIgw
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PublicSubnet1Cidr
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-public-a" }]
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PublicSubnet2Cidr
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-public-b" }]
+
+  AssocRt1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet1
+
+  AssocRt2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet2
+
+  WebSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: SG para HTTP/HTTPS e (opcional) SSH
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+        - !If
+          - UseSSH
+          - { IpProtocol: tcp, FromPort: 22, ToPort: 22, CidrIp: !Ref AllowedSSHLocation }
+          - { IpProtocol: tcp, FromPort: 65535, ToPort: 65535, CidrIp: 127.0.0.1/32 } # no-op
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-web-sg" }]
+    Conditions:
+      UseSSH: !Not [!Equals [!Ref KeyPairName, ""]]
+
+  # Role/InstanceProfile para acesso SSM (Session Manager)
+  Ec2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-ec2-role" }]
+
+  Ec2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref Ec2Role]
+
+  # AMI do Amazon Linux 2023 via SSM param (sempre a mais recente)
+  AL2023AmiParam:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+
+  WebServer:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref AL2023AmiParam
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref Ec2InstanceProfile
+      KeyName: !If [UseSSH, !Ref KeyPairName, !Ref "AWS::NoValue"]
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: true
+          DeviceIndex: 0
+          GroupSet: [!Ref WebSecurityGroup]
+          SubnetId: !Ref PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-web"
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          dnf update -y
+          dnf install -y nginx
+          systemctl enable nginx
+          echo "<h1>Olá, AWS CloudFormation! 🚀</h1><p>Stack: ${AWS::StackName}</p>" > /usr/share/nginx/html/index.html
+          systemctl start nginx
+    Conditions:
+      UseSSH: !Not [!Equals [!Ref KeyPairName, ""]]
+
+  AppBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-s3" }]
+
+Outputs:
+  VpcId:
+    Value: !Ref VPC
+    Export:
+      Name: !Sub "${AWS::StackName}-VpcId"
+  PublicSubnet1Id:
+    Value: !Ref PublicSubnet1
+  PublicSubnet2Id:
+    Value: !Ref PublicSubnet2
+  SecurityGroupId:
+    Value: !Ref WebSecurityGroup
+  InstanceId:
+    Value: !Ref WebServer
+  InstancePublicIp:
+    Value: !GetAtt WebServer.PublicIp
+  S3BucketName:
+    Value: !Ref AppBucket
+    Description: Nome do bucket (gerado pela AWS)
